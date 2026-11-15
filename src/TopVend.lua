@@ -1,3 +1,6 @@
+-- TopVend: marks the quest reward choice that sells for the most gold.
+-- Each supported quest UI is a "provider" (see the bottom half of this file).
+
 local SHOW_COIN = true
 local SHOW_GLOW = true
 local MIN_CHOICES = 2
@@ -5,14 +8,17 @@ local GLOW_COLOR = { 1, 0.82, 0 }
 local COIN_TEXTURE = "Interface\\MoneyFrame\\UI-GoldIcon"
 local GLOW_TEXTURE = "Interface\\Buttons\\UI-ActionButton-Border"
 
--- Item data and custom quest UIs can finish populating after the event that
--- triggered us, so we rescan briefly instead of trusting a single pass.
+-- While item prices are still loading we rescan on this interval, up to the
+-- duration. Once every price is known the rescans stop.
 local SCAN_INTERVAL = 0.1
 local SCAN_DURATION = 1.5
 local MAX_WALK_DEPTH = 5
 
 local GetItemInfo = C_Item.GetItemInfo
 local marks = setmetatable({}, { __mode = "k" })
+
+-- Set by every scan: true while a visible choice still has an unknown price.
+local waitingForData = false
 
 -- Rendering
 
@@ -92,13 +98,15 @@ end
 -- Marks the most valuable visible entry (or entries, on a tie) of one group
 -- of choices. Hidden entries are included so stale marks on pooled buttons
 -- get cleared.
-local function ApplyGroup(entries)
+local function ApplyGroup(group)
   local best, visibleCount, allKnown = 0, 0, true
-  for _, entry in ipairs(entries) do
+  for i = 1, group.n do
+    local entry = group[i]
     if entry.visible then
       visibleCount = visibleCount + 1
       if entry.value == nil then
         allKnown = false
+        waitingForData = true
       elseif entry.value > best then
         best = entry.value
       end
@@ -106,9 +114,46 @@ local function ApplyGroup(entries)
   end
 
   local active = allKnown and visibleCount >= MIN_CHOICES and best > 0
-  for _, entry in ipairs(entries) do
+  for i = 1, group.n do
+    local entry = group[i]
     SetMarked(entry, active and entry.visible and entry.value == best)
   end
+end
+
+-- Scan buffers
+--
+-- Scans run often, so groups and entries are reused between scans instead of
+-- being allocated each time. Providers fill them through scan.BeginGroup and
+-- scan.AddEntry and must not keep references to them.
+
+local groups = {}
+local groupCount = 0
+
+local scan = {}
+
+function scan.BeginGroup()
+  groupCount = groupCount + 1
+  local group = groups[groupCount]
+  if not group then
+    group = { n = 0 }
+    groups[groupCount] = group
+  end
+  group.n = 0
+  return group
+end
+
+function scan.AddEntry(group, owner, anchor, visible, value)
+  local n = group.n + 1
+  group.n = n
+  local entry = group[n]
+  if not entry then
+    entry = {}
+    group[n] = entry
+  end
+  entry.owner = owner
+  entry.anchor = anchor
+  entry.visible = visible
+  entry.value = value
 end
 
 -- Provider registry
@@ -118,13 +163,16 @@ end
 --   isLoaded  function() -> boolean; true once the UI's frames exist
 --   hook      function(schedule); attach hooks that call schedule() whenever
 --             the UI redraws its rewards
---   collect   function() -> array of groups; each group is an array of
---             entries { owner, anchor, visible, value } that compete with
---             each other for the "best" mark
+--   collect   function(scan); for each set of choices that compete with each
+--             other for the "best" mark, call
+--               local group = scan.BeginGroup()
+--               scan.AddEntry(group, owner, anchor, visible, value)
+--             once per choice, where
 --               owner    frame the mark is parented to
 --               anchor   frame or region the mark is sized and placed over
 --               visible  whether the choice is currently on screen
---               value    total vendor copper (see TopVend.GetStackValue)
+--               value    total vendor copper (see TopVend.GetStackValue), or
+--                        nil while the item is still loading
 
 local providers = {}
 local Schedule
@@ -144,10 +192,13 @@ local function RegisterProvider(provider)
 end
 
 local function Refresh()
+  waitingForData = false
   for _, provider in ipairs(providers) do
     if provider.isLoaded() then
-      for _, group in ipairs(provider.collect()) do
-        ApplyGroup(group)
+      groupCount = 0
+      provider.collect(scan)
+      for i = 1, groupCount do
+        ApplyGroup(groups[i])
       end
     end
   end
@@ -165,14 +216,17 @@ driver:SetScript("OnUpdate", function(self, dt)
   end
   sinceScan = 0
   Refresh()
-  if GetTime() >= stopAt then
+  if not waitingForData or GetTime() >= stopAt then
     self:Hide()
   end
 end)
 
 Schedule = function()
   stopAt = GetTime() + SCAN_DURATION
+  sinceScan = 0
   Refresh()
+  -- Always one follow-up pass, in case the UI finishes laying out after its
+  -- hook fires; it keeps going only while prices are still loading.
   driver:Show()
 end
 
@@ -184,6 +238,14 @@ events:RegisterEvent("QUEST_COMPLETE")
 events:RegisterEvent("QUEST_ITEM_UPDATE")
 events:RegisterEvent("GET_ITEM_INFO_RECEIVED")
 events:SetScript("OnEvent", function(_, event)
+  if event == "GET_ITEM_INFO_RECEIVED" then
+    -- Fires constantly for unrelated items; only matters if we're waiting.
+    if waitingForData then
+      Schedule()
+    end
+    return
+  end
+
   -- Custom UIs may create their frames after we load, so retry hooking.
   TryHooks()
   if event ~= "PLAYER_LOGIN" then
@@ -200,6 +262,26 @@ TopVend = {
 
 -- Provider: Blizzard default UI
 
+local BLIZZARD_REWARD_FRAMES = { "QuestInfoRewardsFrame", "MapQuestInfoRewardsFrame" }
+
+local function AddBlizzardChoice(group, button, isQuestLog)
+  local link
+  if isQuestLog then
+    local questID = QuestInfo_GetQuestID and QuestInfo_GetQuestID()
+    link = GetQuestLogItemLink and GetQuestLogItemLink("choice", button:GetID(), questID)
+  else
+    link = GetQuestItemLink("choice", button:GetID())
+  end
+
+  -- The stack count is only exposed through the button's count text.
+  local count = 1
+  if button.Count and button.Count:IsShown() then
+    count = tonumber(button.Count:GetText()) or 1
+  end
+
+  scan.AddEntry(group, button, button.Icon, button:IsVisible(), GetStackValue(link, count))
+end
+
 RegisterProvider({
   name = "Blizzard",
 
@@ -212,59 +294,50 @@ RegisterProvider({
   end,
 
   collect = function()
-    local groups = {}
-
-    for _, frameName in ipairs({ "QuestInfoRewardsFrame", "MapQuestInfoRewardsFrame" }) do
+    for _, frameName in ipairs(BLIZZARD_REWARD_FRAMES) do
       local rewards = _G[frameName]
       if rewards and rewards:IsVisible() then
         -- The world map's quest log panel reads from the log, not the NPC dialog.
         local isQuestLog = frameName == "MapQuestInfoRewardsFrame" or (QuestInfoFrame and QuestInfoFrame.questLog)
-        local entries = {}
-        for _, button in ipairs({ rewards:GetChildren() }) do
+        local group = scan.BeginGroup()
+        for i = 1, rewards:GetNumChildren() do
+          local button = select(i, rewards:GetChildren())
           if button.type == "choice" and button.objectType == "item" and button.Icon then
-            local link
-            if isQuestLog then
-              local questID = QuestInfo_GetQuestID and QuestInfo_GetQuestID()
-              link = GetQuestLogItemLink and GetQuestLogItemLink("choice", button:GetID(), questID)
-            else
-              link = GetQuestItemLink("choice", button:GetID())
-            end
-
-            -- The stack count is only exposed through the button's count text.
-            local count = 1
-            if button.Count and button.Count:IsShown() then
-              count = tonumber(button.Count:GetText()) or 1
-            end
-
-            entries[#entries + 1] = {
-              owner = button,
-              anchor = button.Icon,
-              visible = button:IsVisible(),
-              value = GetStackValue(link, count),
-            }
+            AddBlizzardChoice(group, button, isQuestLog)
           end
         end
-        groups[#groups + 1] = entries
       end
     end
-
-    return groups
   end,
 })
 
 -- Provider: Lorewalker
 
+local LOREWALKER_REWARD_GROUPS = { "QuestItemChoiceRewards", "QuestItemRewards" }
+local lorewalkerButtons = {}
+local lorewalkerButtonCount = 0
+
 -- Lorewalker pools its reward buttons inside nested list frames, so we find
 -- them by the fields it sets on every reward button instead of by path.
-local function FindLorewalkerButtons(frame, found, depth)
-  for _, child in ipairs({ frame:GetChildren() }) do
+local function FindLorewalkerButtons(frame, depth)
+  for i = 1, frame:GetNumChildren() do
+    local child = select(i, frame:GetChildren())
     if child.rewardButtonType ~= nil and child.Item then
-      found[#found + 1] = child
+      lorewalkerButtonCount = lorewalkerButtonCount + 1
+      lorewalkerButtons[lorewalkerButtonCount] = child
     elseif depth < MAX_WALK_DEPTH then
-      FindLorewalkerButtons(child, found, depth + 1)
+      FindLorewalkerButtons(child, depth + 1)
     end
   end
 end
+
+local itemLinks = setmetatable({}, {
+  __index = function(links, itemID)
+    local link = "item:" .. itemID
+    links[itemID] = link
+    return link
+  end,
+})
 
 local function GetLorewalkerValue(button)
   local info = button.rewardInfo
@@ -274,7 +347,7 @@ local function GetLorewalkerValue(button)
   if info.uk_poolElementType == "Currency" then
     return 0
   end
-  local link = button.rewardItemLink or (info.rewardID and ("item:" .. info.rewardID))
+  local link = button.rewardItemLink or (info.rewardID and itemLinks[info.rewardID])
   return GetStackValue(link, info.count)
 end
 
@@ -290,31 +363,23 @@ RegisterProvider({
   end,
 
   collect = function()
-    local groups = {}
     local questFrame = LWDialogFrame.QuestFrame
     if not (questFrame and LWDialogFrame:IsVisible()) then
-      return groups
+      return
     end
 
-    for _, groupName in ipairs({ "QuestItemChoiceRewards", "QuestItemRewards" }) do
-      local group = questFrame[groupName]
-      if group then
-        local buttons = {}
-        FindLorewalkerButtons(group, buttons, 1)
+    for _, groupName in ipairs(LOREWALKER_REWARD_GROUPS) do
+      local list = questFrame[groupName]
+      if list then
+        lorewalkerButtonCount = 0
+        FindLorewalkerButtons(list, 1)
 
-        local entries = {}
-        for _, button in ipairs(buttons) do
-          entries[#entries + 1] = {
-            owner = button.Item,
-            anchor = button.Item,
-            visible = button:IsVisible(),
-            value = GetLorewalkerValue(button),
-          }
+        local group = scan.BeginGroup()
+        for i = 1, lorewalkerButtonCount do
+          local button = lorewalkerButtons[i]
+          scan.AddEntry(group, button.Item, button.Item, button:IsVisible(), GetLorewalkerValue(button))
         end
-        groups[#groups + 1] = entries
       end
     end
-
-    return groups
   end,
 })
