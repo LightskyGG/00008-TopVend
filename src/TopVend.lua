@@ -1,6 +1,3 @@
--- TopVend: marks the quest reward choice that sells for the most gold.
--- Each supported quest UI is a "provider" (see the bottom half of this file).
-
 local SHOW_COIN = true
 local SHOW_GLOW = true
 local MIN_CHOICES = 2
