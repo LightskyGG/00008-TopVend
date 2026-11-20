@@ -2,10 +2,21 @@
 ## ExcludeLoadGameType: plunderstorm, wowhack
 ## Title: TopVend
 ## Notes: Automatically identifies the quest reward that vendors for the highest amount.
-## Version: 2026.11.14
+## Version: 2026.11.19
 ## Author: LightskyGG
 ## SavedVariables: TOPVEND_CONFIG, TOPVEND_DATA
 ## IconTexture: Interface\ICONS\inv_misc_coin_01
 ## AddonCompartmentFunc: TopVend_AddonCompartmentCallback
 
-TopVend.lua
+Data\Defaults.lua
+
+Core\Initialize.lua
+Core\Settings.lua
+Core\Rendering.lua
+Core\Valuation.lua
+Core\Scanning.lua
+Core\Scheduling.lua
+Core\Providers\Blizzard.lua
+Core\Providers\Lorewalker.lua
+
+API\Public.lua
